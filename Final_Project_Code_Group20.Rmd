@@ -1,0 +1,770 @@
+---
+title: "Final Project Kickstarter"
+output: html_document
+---
+
+###May 11, 2022
+###BUDT758T
+###Group 20
+
+**Load libraries and data**
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#install packages
+#install.packages("predictrace")
+#install.packages("textdata")
+#install.packages("ParBayesianOptimization")
+#install.packages('ggcorrplot')
+#install.packages('Boruta')
+#install.packages('mlbench')
+
+#load libraries
+library(tidyverse)
+library(tidytext)
+library(caret)
+library(tree)
+library(dplyr)
+library(ggplot2)
+library(cowplot)
+library(randomForest)
+require(caTools)
+library(predictrace)
+library(stringi)
+library(xgboost)
+library(naivebayes)
+library(e1071)
+
+#nlp packages
+library(tm)
+library(text2vec)
+library(SnowballC)
+library(glmnet)
+library(vip)
+library(textdata)
+library(ParBayesianOptimization)
+library(ggcorrplot)
+library(Boruta)
+library(mlbench)
+
+```
+
+##Data preparation
+```{r}
+#load data files big - use for training final model 
+small_kickstarter_train_x<- read_csv('ks_training_X.csv')
+small_kickstarter_train_y <- read_csv('ks_training_y.csv')
+
+#load test dataset
+kickstarter_test_x <- read_csv('ks_test_X.csv')
+
+set.seed(42)
+
+```
+
+
+**Preparing imported datasets for cleaning**
+```{r}
+#combine train x and y into one dataset 
+small_train <- small_kickstarter_train_x %>%
+  left_join(small_kickstarter_train_y,by="id") %>%
+  mutate(success= as.factor(success),
+         original_TR = 1)  #flags training data set 
+
+kickstarter_test_x <- kickstarter_test_x %>%
+  mutate(original_TR = 0, #flags testing data set
+         success="NO",
+         success = as.factor(success))
+
+#selecting target variable success
+train_success <- small_train %>%
+  select(-c(big_hit, backers_count)) %>%
+  filter(!is.na(success)) # Filter out projects without success data
+
+#combine training and testing data set for data cleaning/feature engineering
+train_success <- rbind(train_success, kickstarter_test_x)
+```
+
+##Data Exploration
+```{r}
+colnames(train_success)
+summary(train_success)
+```
+
+##Data Cleaning
+```{r}
+# convert categorical variables to factors and dealing with missing values
+train_success_clean <- train_success %>%
+                    mutate(isbwImg = ifelse(is.na(isbwImg1),"MISSING",isbwImg1),
+                           isbwImg = as.factor(isbwImg),
+                           isTextPic = ifelse(is.na(isTextPic),2,isTextPic),
+                           isTextPic = as.factor(isTextPic),
+                           isLogoPic = ifelse(is.na(isLogoPic),2,isLogoPic),
+                           isLogoPic = as.factor(isLogoPic),
+                           isCalendarPic = ifelse(is.na(isCalendarPic),2,isCalendarPic),
+                           isCalendarPic = as.factor(isCalendarPic),
+                           isDiagramPic = ifelse(is.na(isDiagramPic),2,isDiagramPic),
+                           isDiagramPic = as.factor(isDiagramPic),
+                           isShapePic = ifelse(is.na(isShapePic),2,isShapePic),
+                           isShapePic = as.factor(isShapePic),
+                           ) %>%
+                  mutate(reward_amounts = ifelse(is.na(reward_amounts),0,reward_amounts),
+                         reward_amounts_count = sapply(strsplit(as.character(reward_amounts),","),length),
+                         name_count = str_length(name),
+                         reward_amounts_min = sapply(strsplit(as.character(reward_amounts),","),head,1),
+                         reward_amounts_max = sapply(strsplit(as.character(reward_amounts),","),tail,1),
+                         name_count = ifelse(is.na(name_count),0,name_count),
+                         reward_amounts_min = ifelse(reward_amounts_min=="B",0,reward_amounts_min), 
+                         reward_amounts_max = ifelse(reward_amounts_max=="D",0,reward_amounts_max),
+                         reward_amounts =  ifelse(reward_amounts_min==0,0,reward_amounts)) 
+
+
+# Creating bins for creator id frequency
+train_success_clean<- train_success_clean %>%
+  group_by(creator_id)%>%
+  mutate(creator_id_freq = n())%>%
+  ungroup()%>%
+  mutate(creator_id_cat = case_when(
+    creator_id_freq >40 ~ "Very Popular",
+    creator_id_freq <=40 & creator_id_freq >10 ~ "Medium Popular",
+    creator_id_freq <=10 & creator_id_freq >5 ~ "Okay Popular",
+    creator_id_freq <=5 & creator_id_freq >2 ~ "Less Popular",
+    TRUE ~ "Not Popular"),
+    creator_id_cat =  as.factor(creator_id_cat))
+
+# Features from length of text data columns (Anna combined code here) - can i at str_length(blurb) into ifelse function?
+train_success_clean <- train_success_clean %>%
+  mutate(length_blurb = str_length(blurb),
+         length_blurb = ifelse(is.na(length_blurb),mean(length_blurb,na.rm=TRUE),length_blurb),
+         length_captions =  str_length(captions),
+         length_captions = ifelse(is.na(length_captions),mean(length_captions,na.rm=TRUE),length_captions),
+         length_descriptions =  str_length(reward_descriptions),
+         length_descriptions = ifelse(is.na(length_descriptions),mean(length_descriptions,na.rm=TRUE),length_descriptions)
+         ) %>%
+  separate(tag_names,into=("genre"),extra="drop")%>% #create a genre feature from tag names
+  mutate(genre =  ifelse(is.na(genre),"Missing",genre),
+         genre = as.factor(genre)
+         )
+
+
+
+# # creating average reward amount for each kickstarter project
+mat <- stri_split_fixed(train_success_clean$reward_amounts, ',', simplify=T)
+mat <- `dim<-`(as.numeric(mat), dim(mat))  # convert to numeric and save dims
+avg_test<-rowMeans(mat, na.rm=T)
+train_success_clean["average_rewards"] <-avg_test
+
+train_success_clean<-train_success_clean %>%
+  mutate(average_rewards = round(average_rewards,digits=1),
+        average_rewards =  ifelse(is.na(average_rewards),mean(average_rewards,na.rm=TRUE),average_rewards))
+
+train_success_clean['reward_amount_sum'] <- sapply(strsplit(train_success_clean$reward_amounts, "[ ,]+"), function(i) sum(as.numeric(i)))
+
+#Cleaning the train dataset create missing for NA values and Others for groupings and create factors based on leased occurrences
+train_success_clean <- train_success_clean %>%
+  mutate(location_state = str_sub(location_slug,-2),
+         location_city = str_sub(location_slug,1,-4),
+         location_type = ifelse(is.na(location_type),"Missing",location_type),
+         location_type = ifelse(location_type %in% c('Island','Zip','Miscellaneous','Estate'),'Other',location_type),
+         location_type = as.factor(location_type),
+         region = as.factor(region),
+         category_parent = ifelse(category_parent %in% c('journalism','photography'),'photography & journalism',category_parent),
+         category_parent =as.factor(category_parent),
+         color_foreground = ifelse(color_foreground %in% c('Purple','Teal','Orange','Pink','None'),'Other',color_foreground),
+         color_foreground = ifelse(is.na(color_foreground)==TRUE,"Missing",color_foreground),
+         color_foreground = as.factor(color_foreground),
+         color_background = ifelse(is.na(color_background)==TRUE,"Missing",color_background),
+         color_background = ifelse(color_background %in% c('None','Purple','Pink','Teal','Orange','Red','Yellow'),'Other',color_background),
+         color_background = as.factor(color_background),
+         accent_color = ifelse(is.na(accent_color)==TRUE,"Missing",accent_color),
+         accent_color = ifelse(accent_color %in% c('666666'),'black','other'),
+         accent_color = as.factor(accent_color),
+         blurb =  ifelse(is.na(blurb),"",blurb),
+         reward_descriptions =  ifelse(is.na(reward_descriptions),"",reward_descriptions),
+         captions =  ifelse(is.na(captions),"",captions)
+         ) %>%
+  group_by(location_state)%>%
+  mutate(count_state = n())%>%
+  ungroup()%>%
+  mutate(location_state = ifelse(count_state <=2000,"Other",location_state),
+         location_state = as.factor(location_state))%>%
+  ungroup()%>%
+  group_by(location_city)%>%
+  mutate(count_cities = n())%>%
+  ungroup()%>%
+  mutate(location_city = ifelse(count_cities <=2000,"Other",location_city),
+         location_city = as.factor(location_city))%>%
+  ungroup()%>%
+  mutate(created_at_year = as.numeric(format(created_at,'%Y')),
+         created_at_year = as.factor(created_at_year),
+         created_at_month = as.numeric(format(created_at,'%m')),
+         created_at_month =  as.factor(created_at_month),
+         launched_at_year = as.numeric(format(launched_at,'%Y')),
+         launched_at_year = as.factor(launched_at_year),
+         launched_at_month = as.numeric(format(launched_at,'%m')),
+         launched_at_month = as.factor(launched_at_month),
+         contains_youtube = as.factor(contains_youtube)
+         ) %>%
+  group_by(category_name)%>%
+  mutate(count_category_name = n())%>%
+  ungroup()%>%
+  mutate(category_name = ifelse(count_category_name <=2000,"Other",category_name),
+         category_name = as.factor(category_name))%>%
+  ungroup()
+  
+
+```
+
+**Feature Creation: NLP**
+```{r}
+#NLP for text features (blurb, caption, reward descriptions)
+cleaning_tokenizer <- function(v) {
+  v %>%
+    removeNumbers %>% #remove all numbers
+    removeWords(stopwords(kind="en")) %>% #remove stopwords
+    stemDocument %>%
+    word_tokenizer
+}
+
+
+# Function to make a TFIDF DTM
+tfidf_func <- function(text_col, id_col) {
+  text_col = as.character(text_col)
+  it_train = itoken(text_col,
+                    preprocessor = tolower,
+                    tokenizer = cleaning_tokenizer,
+                    ids = id_col,
+                    progressbar = FALSE)
+  vocab = create_vocabulary(it_train)
+  vocab = prune_vocabulary(vocab, term_count_min = 10, doc_proportion_max = 0.5)
+  vectorizer_blurb = vocab_vectorizer(vocab)
+  dtm_train = create_dtm(it_train, vectorizer_blurb)
+  dtm_train_tfidf = fit_transform(dtm_train, TfIdf$new()) #creates tfidf matrix
+  dtm_train_bin <- dtm_train_tfidf>0+0
+
+  dtm_train_small<- dtm_train_bin[,(ncol(dtm_train_bin)-3-1):ncol(dtm_train_bin)] # get 5 most frequent words
+
+  matrix <- as.matrix(dtm_train_small)+0
+  matrix_factor <- apply(matrix, MARGIN=2, as.factor) #converting word variables to factors
+  return(matrix_factor)
+}
+
+
+# Adding blurb tfidf to training dataset
+tfidf_blurb <- tfidf_func(train_success_clean$blurb, train_success_clean$id)
+train_success_clean <- cbind(train_success_clean,tfidf_blurb)
+
+# Adding reward description tfidf to training dataset
+tfidf_reward_description <- tfidf_func(train_success_clean$reward_descriptions, train_success_clean$id)
+train_success_clean <- cbind(train_success_clean,tfidf_reward_description)
+
+
+# Adding picture caption tfidf to training dataset
+tfidf_captions <- tfidf_func(train_success_clean$captions, train_success_clean$id)
+train_success_clean <- cbind(train_success_clean,tfidf_captions)
+```
+
+
+**Feature Creation: Demographic Features**
+```{r}
+# Feature from predicted race from predictrace library
+train_success_clean <- train_success_clean %>%
+    mutate(predicted_race = predict_race(creator_name, probability = FALSE), #predicted race (categorical variable)
+           predicted_race = predicted_race$likely_race,
+           predicted_race = ifelse(is.na(predicted_race), 'Unknown',as.factor(predicted_race)))
+
+```
+
+
+**Feature Creation: Unsupervised Sentiment Analysis**
+```{r}
+#create empty list to store sentiment totals for each blurb
+sentiment_list <- rep(0,nrow(train_success_clean))
+
+#loops through each blurb and produces sum of sentiment values with words found in afinn dictionary
+
+## has issues when running it the first time
+for (i in c(1:nrow(train_success_clean))) {
+  blurb <- train_success_clean$blurb[i]
+  blurb <- tibble(txt = blurb)
+  blurb_words <- unnest_tokens(blurb, word, txt, to_lower = TRUE) #separate words in document
+  sentiment_words <- inner_join(get_sentiments("afinn"), blurb_words, by = c("word")) #match words in blurb and dictionary
+  sentiment_total <- sum(sentiment_words$value) #sum sentiment values of all matching words for each document
+  sentiment_list[i] <- sentiment_total #stores total sentiment value in vector
+}
+
+#combines total sentiment value to training data set
+train_success_clean <- cbind(train_success_clean, sentiment_list)
+
+```
+
+**External Dataset: Combine training data set with Dow Jones Industrial Average**
+```{r}
+#import data
+dow_jones <- read_csv('Dow Jones Industrial Average Historical Data.csv')
+dow_jones <- dow_jones %>% mutate(Date = as.Date(Date, format = "%B %d, %Y"))
+
+train_success_clean <- train_success_clean %>%
+  mutate(days_between = as(launched_at-created_at, "numeric"),
+         length_of_project = as(deadline-launched_at, "numeric"),
+         Date = launched_at
+         ) %>%
+  left_join(dow_jones, by="Date") %>% #joining data sets by date
+  group_by(months(Date)) %>%
+  mutate(Price = ifelse(is.na(Price), mean(Price, na.rm=TRUE), Price)
+         ) %>%
+  ungroup() %>%
+  select(-c(Open, High, Low, "Vol.", "Change %",Date,created_at_year,created_at_month,launched_at_year,launched_at_month))
+
+```
+
+
+**Remove unnecessary columns**
+```{r}
+#remove all unnecessary columns including tag_names as we are taking first of that
+train_success_clean <- train_success_clean %>%
+  select(-c(id,creator_id,creator_id_freq,name,creator_name,blurb,captions,reward_amounts,reward_descriptions, num_words, sentence_counter, afinn_neg,color_foreground,color_background, genre))
+
+# Remove all the columns that have been transformed to a new column
+train_success_clean <- train_success_clean %>%
+  select(-c(location_slug,created_at,launched_at,count_category_name,count_state,count_cities,deadline,created_at,launched_at,'months(Date)',isbwImg1))
+```
+
+
+**One hot encoding**
+```{r}
+#create dummy variables
+dummy <- dummyVars( ~ . , data=train_success_clean)
+one_hot_kickstarter <- data.frame(predict(dummy, newdata =train_success_clean))
+one_hot_kickstarter$success.YES <- as.factor(one_hot_kickstarter$success.YES)
+one_hot_kickstarter <- one_hot_kickstarter %>%
+  select(-c(success.NO))
+
+```
+**Split use and input data**
+```{r}
+#extract testing data out from our cleaned data
+use_data = one_hot_kickstarter %>%
+  filter(original_TR == 0) %>%
+  select(-c(success.YES,original_TR))
+
+#extract training data out from our cleaned data
+input_data = one_hot_kickstarter %>%
+  filter(original_TR == 1) %>%
+  select(-c(original_TR))
+```
+
+**Preparing Data for Validation and Performance Comparisons**
+##Preparing Data for Validation
+```{r}
+main_data <- input_data
+
+# splitting training data into train and validation
+tr_rows <- sample(nrow(main_data),.7*nrow(main_data))
+main_train <- main_data[tr_rows,]
+main_valid <- main_data[-tr_rows,]
+
+input_data_models = train_success_clean %>%
+  filter(original_TR == 1) %>%
+  select(-c(original_TR))
+
+# getting 10,000 records to use for testing mode accuracy
+input_data_for_models <- sample_n(input_data_models, 10000)
+tr_rows_models <- sample(nrow(input_data_for_models),.7*nrow(input_data_for_models))
+main_train_models <- input_data_for_models[tr_rows_models,]
+main_valid_models <- input_data_for_models[-tr_rows_models,]
+
+# getting 10,000 records for onehotencoding to use for testing mode accuracy
+input_data_for_models_oh <- sample_n(input_data, 10000)
+tr_rows_models_oh <- sample(nrow(input_data_for_models_oh),.7*nrow(input_data_for_models_oh))
+main_train_models_oh <- input_data_for_models_oh[tr_rows_models_oh,]
+main_valid_models_oh <- input_data_for_models_oh[-tr_rows_models_oh,]
+
+```
+
+**Accuracy and classification functions**
+```{r}
+#Accuracy function
+accuracy <- function(classifications, actuals){
+  correct_classifications <- ifelse(classifications == actuals, 1, 0)
+  acc <- sum(correct_classifications)/length(classifications)
+  return(acc)
+}
+
+#Classification function
+classify <- function(scores, c){
+  classifications <- ifelse(scores > c, "YES" , "NO") 
+  return(classifications) 
+}
+
+```
+
+
+##Models
+**1) Logistic Regression**
+```{r}
+# remove categories with more levels that don't work with logistic regression
+main_train_models<- main_train_models%>%
+  select(-c(reward_amounts_min,reward_amounts_max))
+
+logistic_success <- glm(success~., data = main_train_models, family = "binomial")
+
+probs_success <- predict(logistic_success, newdata = main_valid_models, type = "response")
+
+#make binary classifications (make sure to check for NAs!)
+classifications_success <- ifelse(probs_success > .45, "YES", "NO")
+
+log_reg_acc <-accuracy(classifications_success,main_valid_models$success)
+log_reg_acc
+#0.698
+```
+
+
+**2) Tree Model**
+```{r}
+#create full tree
+mycontrol = tree.control(nobs = nrow(main_train_models), mincut = 1, minsize = 2, mindev = 0)
+full_tree <- tree(success ~ .,
+                  data = main_train_models,
+                  control = mycontrol)
+
+#predict and get accuracy for full tree
+full_tree_pred <- predict(full_tree,newdata = main_train_models)
+full_tree_classify <- classify(full_tree_pred[,2],0.5)
+full_treet_pred_accuracy <- accuracy(full_tree_classify,main_valid_models$success )
+full_treet_pred_accuracy
+
+#predict and get accuracy for default tree
+default_tree=tree(success ~ ., main_train_models)
+default_tree_pred <- predict(default_tree,newdata = main_valid_models)
+default_tree_classify <- classify(default_tree_pred[,2],0.5)
+default_tree_pred_accuracy <- accuracy(default_tree_classify,main_valid_models$success )
+default_tree_pred_accuracy
+
+#test where to prune using tree plot
+tree_list <- seq(from = 5, to = 120, by = 10)
+tree_acc <- rep(0,length(tree_list))
+
+k <-length(tree_list)
+for(i in 1:k){
+  pruned_tree_loop <- prune.tree(full_tree, best = tree_list[[i]])
+  pruned_tree_pred <- predict(pruned_tree_loop,newdata = main_valid_models)
+  pruned_tree_classify <- classify(pruned_tree_pred[,2],0.5)
+  pruned_treet_pred_accuracy <- accuracy(pruned_tree_classify,main_valid_models$success )
+  tree_acc[i]<- pruned_treet_pred_accuracy
+print(i)
+}
+
+#plot tree plot
+plot(tree_list,tree_acc, type="l", col="green", lwd=5, xlab="Tree Size", ylab="Accuracy", main="Tree size VS Accuracy")
+tree_list[which.max(tree_acc)]
+max(tree_acc)
+
+#calculate accuracy for pruned tree
+pruned_tree_loop <- prune.tree(full_tree, best = tree_list[which.max(tree_acc)])
+pruned_tree_pred <- predict(pruned_tree_loop,newdata = main_valid_models)
+pruned_tree_classify <- classify(pruned_tree_pred[,2],0.5)
+pruned_tree_pred_accuracy <- accuracy(pruned_tree_classify,main_valid_models$success )
+pruned_tree_pred_accuracy
+#0.692
+
+plot(pruned_tree_loop)
+text(pruned_tree_loop)
+```
+
+**3) Random Forest**
+```{r}
+tree_list <- seq(from = 10, to = 35, by = 5)
+tree_acc <- rep(0,length(tree_list))
+k <-length(tree_list)
+
+#loop over mtry to find best value
+for (i in 1: k ){
+  rf.mod <- randomForest(success~.,
+                         data=main_train_models,
+                         mtry=tree_list[k], ntree=100,
+                         importance=TRUE)
+  rf_preds <- predict(rf.mod,newdata = main_valid_models,type="prob")
+  rf_pred_classify <- classify(rf_preds[,2],0.5)
+  rf_pred_accuracy <- accuracy(rf_pred_classify,main_valid_models$success )
+
+  tree_acc[i] <- rf_pred_accuracy
+  print(i)
+}
+
+#plot accuracy graph by mtry size
+plot(tree_list,tree_acc, type="l", col="green", lwd=5, xlab="Mtry Size", ylab="Accuracy", main="Mtry VS Accuracy")
+
+tree_list[which.max(tree_acc)]
+max(tree_acc)
+#0.7266667
+
+#predict and get accuracy for final random forest model
+rf.mod <- randomForest(success~.,
+                       data=main_train_models,
+                       mtry=tree_list[which.max(tree_acc)], ntree=500,
+                       importance=TRUE)
+rf_preds <- predict(rf.mod,newdata = main_valid_models,type="prob")
+rf_pred_classify <- classify(rf_preds[,2],0.5)
+rf_pred_accuracy <- accuracy(rf_pred_classify,main_valid_models$success )
+rf_pred_accuracy
+#0.7233333
+```
+
+
+**4) XGBoost**
+```{r}
+#split data into X and Y for training and validation
+main_train_X <- main_train_models_oh%>%
+              select(-c(success.YES))
+main_valid_X <- main_valid_models_oh%>%
+  select(-c(success.YES))
+main_train_y <- main_train_models_oh$success.YES
+main_valid_y <- main_valid_models_oh$success.YES
+main_train_y <- as.numeric(as.character(main_train_y))
+
+
+bst <- xgboost(data = data.matrix(main_train_X), label = main_train_y, max.depth = 30, eta = 0.1, nrounds = 200,  objective = "binary:logistic")
+
+#predict and get accuracy
+y_pred <- predict(bst, data.matrix(main_valid_X))
+bst_classifications <- ifelse(y_pred > 0.50, 1, 0)
+bst_acc <- mean(ifelse(bst_classifications == main_valid_y, 1, 0))
+bst_acc
+#0.752
+
+```
+
+**5) Naive Bayes**
+```{r}
+#create naive bayes model
+NB_smoothed <- naive_bayes(success.YES ~., data=main_train_models_oh ,laplace=30)
+nb_preds <- predict(NB_smoothed, main_valid_models_oh, type = "prob")[,2]
+nb_class <- ifelse(nb_preds > 0.5, 1, 0)
+nb_acc <- mean(ifelse(nb_class == main_valid_models_oh$success.YES, 1, 0))
+nb_acc
+#0.5626667
+```
+
+**6) Lasso**
+```{r}
+#sparse matrix to create dtm
+sparse_matrix <- sparse.model.matrix(success.YES ~ .-1, data = input_data_for_models_oh)
+tr_dtm <- sparse_matrix[1:7000,]
+va_dtm <- sparse_matrix[7000:10000,]
+
+tr_y <- input_data_for_models_oh[1:7000,]$success.YES
+va_y <- input_data_for_models_oh[7000:10000,]$success.YES
+
+#lasso model with best lambda
+cv.out.lasso <- cv.glmnet(tr_dtm, tr_y, alpha = 1, family="binomial")
+plot(cv.out.lasso)
+bestlam_lasso <- cv.out.lasso$lambda.min
+
+#predict using best lambda and get accuracy
+pred_lasso <- predict(cv.out.lasso, s=bestlam_lasso, newx = va_dtm,type="response")
+class_lasso <- ifelse(pred_lasso > 0.5, 1, 0)
+acc_lasso = mean(ifelse(class_lasso == va_y, 1, 0))
+acc_lasso
+#0.6294511
+```
+
+**7) Ridge**
+```{r}
+#ridge model with best lambda
+cv.out.ridge <- cv.glmnet(tr_dtm, tr_y, alpha = 0, family="binomial")
+plot(cv.out.ridge)
+bestlam_ridge <- cv.out.ridge$lambda.min
+
+#predict using best lambda and get accuracy
+pred_ridge <- predict(cv.out.ridge, s=bestlam_ridge, newx = va_dtm,type="response")
+class_ridge <- ifelse(pred_ridge > 0.5, 1, 0)
+acc_ridge = mean(ifelse(class_ridge == va_y, 1, 0))
+acc_ridge
+#0.6190173
+```
+
+**Feature Selection **
+```{r}
+#Getting the numeric data for correlation graph
+numeric_train <-select_if(train_success_clean, is.numeric)
+ggcorrplot(cor(numeric_train))
+
+#sampling 200 rows to generate the Boruta feature selection
+new_input_data <- sample_n(train_success_clean,200)
+tr_rows <- sample(nrow(new_input_data),.7*nrow(new_input_data))
+tr_data <- new_input_data[tr_rows,]
+va_data <- new_input_data[-tr_rows,]
+
+#execute bouruta for 1000 runs to generate all the features and the shadow copies
+boruta <- Boruta(success~.,data=tr_data,doTrace=2,maxRuns=1000)
+print(boruta)
+plot(boruta,las=2,cex.axis=0.7)
+
+#Generate the formula for the most useful variables
+getConfirmedFormula(boruta)
+# goal + sentence_counter + NOUN + ADP + ADJ + film + reward_amounts_count
+
+#get all the variables except from the non rejected section
+getNonRejectedFormula(boruta)jectedFormula(boruta)
+```
+
+**Model Comparison for different data**
+```{r}
+#Selecting all variables except all the text features (tfidf) for validation and testing
+main_train_models_oh_without_nlp <- main_train_models_oh %>%
+                                  select(-c(make0,make1,film0,film1,will0,will1,new0,new1,help0,help1,receiv0,receiv1,sign0,sign1,get0,get1,
+                                            sign0,sign1,get0,get1,plus0,plus1,copi0,copi1,man0,man1,group0,group1,text0,text1,person0,person1))
+main_valid_models_oh_without_nlp <- main_valid_models_oh %>%
+                                  select(-c(make0,make1,film0,film1,will0,will1,new0,new1,help0,help1,receiv0,receiv1,sign0,sign1,get0,get1,
+                                            sign0,sign1,get0,get1,plus0,plus1,copi0,copi1,man0,man1,group0,group1,text0,text1,person0,person1))
+#splitting X and y for xgboost
+main_train_X <- main_train_models_oh_without_nlp%>%
+              select(-c(success.YES))
+main_valid_X <- main_valid_models_oh_without_nlp%>%
+  select(-c(success.YES))
+main_train_y <- main_train_models_oh_without_nlp$success.YES
+main_valid_y <- main_valid_models_oh_without_nlp$success.YES
+main_train_y <- as.numeric(as.character(main_train_y))
+
+#Train Xgboost with all variables except text features
+bst <- xgboost(data = data.matrix(main_train_X), label = main_train_y, max.depth = 30, eta = 0.1, nrounds = 200,  objective = "binary:logistic")
+y_pred <- predict(bst, data.matrix(main_valid_X))
+
+# Generate the classifications and find the accuracy
+bst_classifications <- ifelse(y_pred > 0.50, 1, 0)
+bst_acc <- mean(ifelse(bst_classifications == main_valid_models_oh_without_nlp$success.YES, 1, 0))
+#0.7426667
+bst_acc
+
+
+#Train XGboost with all the text features
+main_train_X <- main_train_models_oh%>%
+              select(-c(success.YES))
+main_valid_X <- main_valid_models_oh%>%
+  select(-c(success.YES))
+main_train_y <- main_train_models_oh$success.YES
+main_valid_y <- main_valid_models_oh$success.YES
+main_train_y <- as.numeric(as.character(main_train_y))
+
+bst <- xgboost(data = data.matrix(main_train_X), label = main_train_y, max.depth = 6, eta = 0.1, nrounds = 200,  objective = "binary:logistic")
+
+y_pred <- predict(bst, data.matrix(main_valid_X))
+
+# Generate the classifications and find the accuracy
+bst_classifications <- ifelse(y_pred > 0.50, 1, 0)
+bst_acc <- mean(ifelse(bst_classifications == main_valid_models_oh$success.YES, 1, 0))
+# 0.747
+bst_acc
+
+
+#Train XGboost without the features from the External Data Source
+main_train_models_oh_without_external <- main_train_models_oh %>%
+                                  select(-c(Price))
+
+main_valid_models_oh_without_external <- main_valid_models_oh %>%
+                                  select(-c(Price))
+
+main_train_X <- main_train_models_oh_without_external%>%
+              select(-c(success.YES))
+main_valid_X <- main_valid_models_oh_without_external%>%
+  select(-c(success.YES))
+main_train_y <- main_train_models_oh_without_external$success.YES
+main_valid_y <- main_valid_models_oh_without_external$success.YES
+
+main_train_y <- as.numeric(as.character(main_train_y))
+
+bst <- xgboost(data = data.matrix(main_train_X), label = main_train_y, max.depth = 30, eta = 0.1, nrounds = 200,  objective = "binary:logistic")
+
+y_pred <- predict(bst, data.matrix(main_valid_X))
+
+# Generate the classifications and find the accuracy
+bst_classifications <- ifelse(y_pred > 0.50, 1, 0)
+bst_acc <- mean(ifelse(bst_classifications == main_valid_models_oh_without_external$success.YES, 1, 0))
+#0.73833
+bst_acc
+
+#Generate the variable importance plot for XGb
+importance_matrix <- xgb.importance(model = bst)
+xgb.plot.importance(importance_matrix = importance_matrix)
+
+#Plot the fitting curve for Logloss and Nrounds for optimization fitting curve
+plot(bst$evaluation_log$iter,bst$evaluation_log$train_logloss, type='l', col="green", lwd=5, xlab="N rounds", ylab="Logloss", main="Logloss VS N round")
+
+#Finding the ideal value for the max Tree depth for Xgboost
+tree_list <- seq(from = 2, to = 20, by = 2)
+tree_acc <- rep(0,length(tree_list))
+
+k <-length(tree_list)
+
+for (i in 1: k ){
+  bst.mod <- xgboost(data = data.matrix(main_train_X), label = main_train_y, max.depth = tree_list[i], eta = 0.1, nrounds = 100,
+                    objective = "binary:logistic")
+  bst_preds <- predict(bst.mod, data.matrix(main_valid_X))
+  bst_classifications <- ifelse(bst_preds > 0.50, 1, 0)
+  bst_acc <- mean(ifelse(bst_classifications == main_valid_models_oh$success.YES, 1, 0))
+  tree_acc[i] <- bst_acc
+  print(i)
+}
+
+#Plot the fitting curve for Max depth vs Accuracy
+plot(tree_list,tree_acc, type="l", col="green", lwd=5, xlab="Max Depth Size", ylab="Accuracy", main="Max Dept VS Accuracy")
+```
+
+##Make predictions using selected model (XGBoost)
+```{r}
+#Split data into X and Y for xgboost for Train and Use data
+input_data_x <- input_data%>%
+  select(-c(success.YES))
+use_data_x <- use_data
+input_data_y <- as.numeric(as.character(input_data$success.YES))
+
+
+# Do 5-fold Cross validation for Xgboost
+data(agaricus.train, package = "xgboost")
+
+Folds <- list(
+    Fold1 = as.integer(seq(1,nrow(agaricus.train$data),by = 3))
+  , Fold2 = as.integer(seq(2,nrow(agaricus.train$data),by = 3))
+  , Fold3 = as.integer(seq(3,nrow(agaricus.train$data),by = 3))
+)
+
+scoringFunction <- function(max_depth, min_child_weight, subsample) {
+
+  dtrain <- xgb.DMatrix(agaricus.train$data,label = agaricus.train$label)
+  
+  Pars <- list( 
+      booster = "gbtree"
+    , eta = 0.01
+    , max_depth = max_depth
+    , min_child_weight = min_child_weight
+    , subsample = subsample
+    , objective = "binary:logistic"
+    , eval_metric = "auc"
+  )
+
+  xgbcv <- xgb.cv(
+      params = Pars
+    , data = dtrain
+    , nround = 100
+    , folds = Folds
+    , prediction = TRUE
+    , showsd = TRUE
+    , early_stopping_rounds = 5
+    , maximize = TRUE
+            , verbose = 0)
+
+  return(list(Score = max(xgbcv$evaluation_log$test_auc_mean)))
+  }
+    
+
+# Train the best Xgboost model from previous parameters for max depth and nrounds: maxdepth->4 and nrounds -> 1000
+bst <- xgboost(data = data.matrix(input_data_x), label = input_data_y, max.depth = 4, eta = 0.1, nrounds = 1000,  objective = "binary:logistic")
+
+#output predictions
+y_pred <- predict(bst, data.matrix(use_data))
+classifications_success <- ifelse(y_pred > 0.50, "YES", "NO")
+write.table(classifications_success, "success_group20.csv", row.names = FALSE)
+```
+
+
