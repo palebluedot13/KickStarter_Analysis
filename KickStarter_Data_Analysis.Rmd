@@ -261,7 +261,7 @@ tfidf_captions <- tfidf_func(train_success_clean$captions, train_success_clean$i
 train_success_clean <- cbind(train_success_clean,tfidf_captions)
 ```
 
-
+ 
 **Feature Creation: Demographic Features**
 ```{r}
 # Feature from predicted race from predictrace library
