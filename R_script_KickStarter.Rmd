@@ -1,11 +1,8 @@
 ---
-title: "Final Project Kickstarter"
+title: "Project Kickstarter"
 output: html_document
 ---
 
-###May 11, 2022
-###BUDT758T
-###Group 20
 
 **Load libraries and data**
 ```{r setup, include=FALSE}
